@@ -1,0 +1,1648 @@
+#face1 return 5 rows
+import streamlit as st
+import sqlite3
+
+# Function to connect to SQLite database
+def connect_to_database(db_path):
+    return sqlite3.connect(db_path)
+
+# Function to fetch table names from SQLite database
+def fetch_table_names(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    return [table[0] for table in tables]
+
+# Function to fetch and display first 5 rows from a table
+def fetch_first_five_rows(conn, table_name):
+    cursor = conn.cursor()
+    query = f"SELECT * FROM {table_name} LIMIT 5"  # Dynamic query with table name
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    return rows
+
+# Main function
+def main():
+    st.title("Display First 5 Rows of SQLite Table")
+
+    # Connect to SQLite database
+    db_path = "pdf_texts3.db"  # Replace with your database path
+    conn = connect_to_database(db_path)
+
+    # Fetch table names
+    table_names = fetch_table_names(conn)
+
+    # Debug print for table names
+    print(f"Fetched table names: {table_names}")
+
+    # Check if table_names is empty
+    if not table_names:
+        st.write("No tables found in the database.")
+        return
+
+    # Select table to display
+    table_name = st.selectbox("Select table to display:", table_names)
+
+    # Fetch and display first 5 rows
+    rows = fetch_first_five_rows(conn, table_name)
+
+    if rows:
+        st.write(f"First 5 rows from {table_name} table:")
+        for row in rows:
+            st.write(row)
+    else:
+        st.write("No data available.")
+
+    # Close database connection
+    conn.close()
+
+if __name__ == "__main__":
+    main()
+##main
+import os
+import pytesseract
+from PIL import Image
+import fitz
+import cv2
+import numpy as np
+import io
+from fpdf import FPDF
+import sqlite3
+
+# Set pytesseract path (Usually where tesseract executable is located)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+def correct_skewness(image):
+    """
+    Corrects skewness of the image, if necessary
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated
+
+
+def extract_text_from_image(image):
+    """
+    Extract text from image using pytesseract
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray_image)
+    return text.strip()
+
+
+def check_scanned_pdf(pdf_file):
+    """
+    Check if PDF contains images
+    """
+    images = []
+
+    pdf_doc = fitz.open(pdf_file)
+    for page_num in range(len(pdf_doc)):
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = pdf_doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            images.append((image, page_num + 1))  # Tuple with image and page number
+
+    return images
+
+
+def extract_text_from_scanned_pdf(pdf_file):
+    extracted_texts = []
+    images = check_scanned_pdf(pdf_file)
+
+    if images:
+        for image, page_num in images:
+            deskewed_image = correct_skewness(image)
+            text = extract_text_from_image(deskewed_image)
+            extracted_texts.append((text.strip(), page_num))
+
+    return extracted_texts
+
+
+def extract_text_from_directory(src_folder, dest_folder, db_name):
+    """
+    Extract text from PDFs in subfolders and save to corresponding new PDFs
+    """
+    # Create destination folder if it doesn't exist
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+
+    # Create SQLite table
+    create_sqlite_table(db_name)
+
+    # Iterate through subfolders
+    for subfolder in ['Contracts', 'Policies', 'ISO']:
+        sub_src_folder = os.path.join(src_folder, subfolder)
+
+        for filename in os.listdir(sub_src_folder):
+            if filename.endswith('.pdf'):
+                src_path = os.path.join(sub_src_folder, filename)
+
+                # Check if the PDF is a scanned PDF
+                texts = extract_text_from_scanned_pdf(src_path)
+                if not texts:
+                    # Read text from readable PDF
+                    pdf_doc = fitz.open(src_path)
+                    texts = [(page.get_text().strip(), index + 1) for index, page in enumerate(pdf_doc)]
+
+                # Insert into SQLite table
+                insert_into_sqlite_table(db_name, filename, subfolder, texts)
+                print(f"Inserted text from {filename} in folder {subfolder} into SQLite table")
+
+
+def create_sqlite_table(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Create table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pdf_texts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT,
+        category TEXT,
+        text TEXT,
+        page INTEGER
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def insert_into_sqlite_table(db_name, file_name, category, texts):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Insert data
+    for text, page_num in texts:
+        cursor.execute("INSERT INTO pdf_texts (file_name, category, text, page) VALUES (?, ?, ?, ?)",
+                       (file_name, category, text, page_num))
+
+    conn.commit()
+    conn.close()
+
+
+if __name__ == "__main__":
+    src_folder = r"C:\Users\srija\OneDrive\Desktop\abc"
+    dest_folder = r"C:\Users\srija\OneDrive\Desktop\Readable"
+    db_name = "pdf_texts3.db"
+###face2 fetch 3 rows
+import streamlit as st
+import sqlite3
+
+# Function to connect to SQLite database
+def connect_to_database(db_path):
+    return sqlite3.connect(db_path)
+
+# Function to fetch table names from SQLite database
+def fetch_table_names(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = cursor.fetchall()
+    return [table[0] for table in tables]
+
+# Function to fetch and display first 3 rows from a table
+def fetch_first_three_rows(conn, table_name):
+    cursor = conn.cursor()
+    query = f"SELECT * FROM {table_name} LIMIT 3"  # Dynamic query with table name
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    return rows
+
+# Main function
+def main():
+    st.title("Display First 3 Rows of SQLite Table")
+
+    # Connect to SQLite database
+    db_path = "pdf_texts3.db"  # Replace with your database path
+    conn = connect_to_database(db_path)
+
+    # Fetch table names
+    table_names = fetch_table_names(conn)
+
+    # Select table to display
+    table_name = st.selectbox("Select table to display:", table_names)
+
+    # Fetch and display first 3 rows
+    rows = fetch_first_three_rows(conn, table_name)
+
+    if rows:
+        st.write(f"First 3 rows from {table_name} table:")
+        for row in rows:
+            st.write(row)
+    else:
+        st.write("No data available.")
+
+    # Close database connection
+    conn.close()
+
+if __name__ == "__main__":
+    main()
+### full main
+import os
+import pytesseract
+from PIL import Image
+import fitz
+import cv2
+import numpy as np
+import io
+import sqlite3
+
+# Set pytesseract path (Usually where tesseract executable is located)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+def correct_skewness(image):
+    """
+    Corrects skewness of the image, if necessary
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated
+
+
+def extract_text_from_image(image):
+    """
+    Extract text from image using pytesseract
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray_image)
+    return text.strip()
+
+
+def check_scanned_pdf(pdf_file):
+    """
+    Check if PDF contains images
+    """
+    images = []
+
+    pdf_doc = fitz.open(pdf_file)
+    for page_num in range(len(pdf_doc)):
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = pdf_doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            images.append((image, page_num + 1))  # Tuple with image and page number
+
+    return images
+
+
+def extract_text_from_scanned_pdf(pdf_file):
+    extracted_texts = []
+    images = check_scanned_pdf(pdf_file)
+
+    if images:
+        for image, page_num in images:
+            deskewed_image = correct_skewness(image)
+            text = extract_text_from_image(deskewed_image)
+            extracted_texts.append((text.strip(), page_num))
+
+    return extracted_texts
+
+
+def extract_text_from_directory(src_folder, dest_folder, db_name):
+    """
+    Extract text from PDFs in subfolders and save to corresponding new PDFs
+    """
+    # Create destination folder if it doesn't exist
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+
+    # Create SQLite table
+    create_sqlite_table(db_name)
+
+    # Iterate through subfolders
+    for subfolder in ['Contracts', 'Policies', 'ISO']:
+        sub_src_folder = os.path.join(src_folder, subfolder)
+
+        for filename in os.listdir(sub_src_folder):
+            if filename.endswith('.pdf'):
+                src_path = os.path.join(sub_src_folder, filename)
+
+                # Check if the PDF is a scanned PDF
+                texts = extract_text_from_scanned_pdf(src_path)
+                if not texts:
+                    # Read text from readable PDF
+                    pdf_doc = fitz.open(src_path)
+                    texts = [(page.get_text().strip(), index + 1) for index, page in enumerate(pdf_doc)]
+
+                # Insert into SQLite table
+                insert_into_sqlite_table(db_name, filename, subfolder, texts)
+                print(f"Inserted text from {filename} in folder {subfolder} into SQLite table")
+
+
+def create_sqlite_table(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Create table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pdf_texts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT,
+        category TEXT,
+        text TEXT,
+        page INTEGER
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def insert_into_sqlite_table(db_name, file_name, category, texts):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Insert data
+    for text, page_num in texts:
+        cursor.execute("INSERT INTO pdf_texts (file_name, category, text, page) VALUES (?, ?, ?, ?)",
+                       (file_name, category, text, page_num))
+
+    conn.commit()
+    conn.close()
+
+
+def fetch_and_display_first_three_rows(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Fetch first 3 rows
+    cursor.execute("SELECT * FROM pdf_texts LIMIT 3")
+    rows = cursor.fetchall()
+
+    if rows:
+        print(f"First 3 rows from pdf_texts table:")
+        for row in rows:
+            print(row)
+    else:
+        print("No data available.")
+
+    conn.close()
+
+
+if __name__ == "__main__":
+    src_folder = r"C:\Users\srija\OneDrive\Desktop\abc"
+    dest_folder = r"C:\Users\srija\OneDrive\Desktop\Readable"
+    db_name = "pdf_texts3.db"
+
+    extract_text_from_directory(src_folder, dest_folder, db_name)
+
+if __name__ == "__main__":
+    src_folder = r"C:\Users\srija\OneDrive\Desktop\abc"
+    dest_folder = r"C:\Users\srija\OneDrive\Desktop\Readable"
+    db_name = "pdf_texts6.db"
+
+    extract_text_from_directory(src_folder, dest_folder, db_name)
+####return 5 rows no error
+import os
+import pytesseract
+from PIL import Image
+import fitz
+import cv2
+import numpy as np
+import io
+import sqlite3
+import streamlit as st
+import pandas as pd
+
+# Set pytesseract path (Usually where tesseract executable is located)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+def correct_skewness(image):
+    """
+    Corrects skewness of the image, if necessary
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated
+
+
+def extract_text_from_image(image):
+    """
+    Extract text from image using pytesseract
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray_image)
+    return text.strip()
+
+
+def check_scanned_pdf(pdf_file):
+    """
+    Check if PDF contains images
+    """
+    images = []
+
+    pdf_doc = fitz.open(pdf_file)
+    for page_num in range(len(pdf_doc)):
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = pdf_doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            images.append((image, page_num + 1))  # Tuple with image and page number
+
+    return images
+
+
+def extract_text_from_scanned_pdf(pdf_file):
+    extracted_texts = []
+    images = check_scanned_pdf(pdf_file)
+
+    if images:
+        for image, page_num in images:
+            deskewed_image = correct_skewness(image)
+            text = extract_text_from_image(deskewed_image)
+            extracted_texts.append((text.strip(), page_num))
+
+    return extracted_texts
+
+
+def extract_text_from_directory(src_folder, dest_folder, db_name):
+    """
+    Extract text from PDFs in subfolders and save to corresponding new PDFs
+    """
+    # Create destination folder if it doesn't exist
+    if not os.path.exists(dest_folder):
+        os.makedirs(dest_folder)
+
+    # Create SQLite table
+    create_sqlite_table(db_name)
+
+    # Iterate through subfolders
+    for subfolder in ['Contracts', 'Policies', 'ISO']:
+        sub_src_folder = os.path.join(src_folder, subfolder)
+
+        for filename in os.listdir(sub_src_folder):
+            if filename.endswith('.pdf'):
+                src_path = os.path.join(sub_src_folder, filename)
+
+                # Check if the PDF is a scanned PDF
+                texts = extract_text_from_scanned_pdf(src_path)
+                if not texts:
+                    # Read text from readable PDF
+                    pdf_doc = fitz.open(src_path)
+                    texts = [(page.get_text().strip(), index + 1) for index, page in enumerate(pdf_doc)]
+
+                # Insert into SQLite table
+                insert_into_sqlite_table(db_name, filename, subfolder, texts)
+                print(f"Inserted text from {filename} in folder {subfolder} into SQLite table")
+
+
+def create_sqlite_table(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Create table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS pdf_texts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT,
+        category TEXT,
+        text TEXT,
+        page INTEGER
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def insert_into_sqlite_table(db_name, file_name, category, texts):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Insert data
+    for text, page_num in texts:
+        cursor.execute("INSERT INTO pdf_texts (file_name, category, text, page) VALUES (?, ?, ?, ?)",
+                       (file_name, category, text, page_num))
+
+    conn.commit()
+    conn.close()
+
+
+def fetch_data(db_name):
+    conn = sqlite3.connect(db_name)
+    query = "SELECT * FROM pdf_texts LIMIT 5"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+def main():
+    st.title("PDF Text Extraction App")
+
+    db_name = "pdf_texts9.db"
+    df = fetch_data(db_name)
+
+    if df.empty:
+        st.write("No data available.")
+    else:
+        st.write("First 5 rows from pdf_texts table:")
+        st.table(df)
+
+
+if __name__ == "__main__":
+    main()
+###imstructions1.go through the src_folder which has 3 subfolders(mix of scanned and normal pdfs)
+##differentiatiate them .
+#2. Create an sqlite db table named filedetails with 4 coloumn(filename, categeor(subdirectory name),pagenumber,text)
+#3. Extract text from each page of the pdf(use ocr to extract from scanned pdfs )and make an entry in the table
+#example:if a file in subdir a of folder abc has 12 pages there should be 12 rows in the table with same file name,same categeory but with diff pg number and text
+#keyword search
+import sqlite3
+import pandas as pd
+import streamlit as st
+
+def search_data(db_name, keyword, category):
+    conn = sqlite3.connect(db_name)
+    
+    # Prepare SQL query
+    query = f"SELECT * FROM filedetails WHERE text LIKE ? AND category = ?"
+    
+    # Fetch data with keyword and category
+    df = pd.read_sql_query(query, conn, params=('%' + keyword + '%', category))
+    
+    conn.close()
+    return df
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+    
+    st.title("Search and Display PDF Text Extraction Results")
+    
+    # Search keyword input
+    keyword = st.text_input("Enter keyword to search:", "")
+    
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+    
+    if st.button("Search"):
+        # Fetch data based on keyword and category
+        df = search_data(db_name, keyword, category)
+        
+        # Display results in Streamlit table
+        if df.empty:
+            st.write(f"No results found for keyword '{keyword}' in the '{category}' category.")
+        else:
+            st.table(df)
+#keyword highlighted
+import sqlite3
+import pandas as pd
+import streamlit as st
+
+def highlight_keyword(text, keyword):
+    """
+    Highlight the keyword in the text
+    """
+    return text.replace(keyword, f"<mark>{keyword}</mark>")
+
+def search_data(db_name, keyword, category):
+    conn = sqlite3.connect(db_name)
+
+    # Prepare SQL query
+    query = f"SELECT * FROM filedetails WHERE text LIKE ? AND category = ?"
+
+    # Fetch data with keyword and category
+    df = pd.read_sql_query(query, conn, params=('%' + keyword + '%', category))
+
+    conn.close()
+
+    # Highlight keyword in text column
+    df['text'] = df['text'].apply(highlight_keyword, keyword=keyword)
+    return df
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+
+    st.title("Search and Display PDF Text Extraction Results")
+
+    # Search keyword input
+    keyword = st.text_input("Enter keyword to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keyword and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit table with highlighted keywords
+        if df.empty:
+            st.write(f"No results found for keyword '{keyword}' in the '{category}' category.")
+        else:
+            # Display table with highlighted keywords
+            st.write(df.to_html(escape=False), unsafe_allow_html=True)
+###verif
+import sqlite3
+import pandas as pd
+import streamlit as st
+import re
+
+def highlight_keyword(text, keyword):
+    """
+    Highlight the keyword in the text using HTML styling
+    """
+    return re.sub(r'(' + keyword + ')', r'<mark>\1</mark>', text, flags=re.IGNORECASE)
+
+def search_data(db_name, keyword, category):
+    conn = sqlite3.connect(db_name)
+
+    # Prepare SQL query
+    query = f"SELECT * FROM filedetails WHERE text LIKE ? AND category = ?"
+
+    # Fetch data with keyword and category
+    df = pd.read_sql_query(query, conn, params=('%' + keyword + '%', category))
+
+    conn.close()
+
+    # Highlight keyword in text column
+    df['text'] = df['text'].apply(highlight_keyword, keyword=keyword)
+    return df
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+
+    st.title("Contracts,ISO And Policy SearchBot")
+
+    # Search keyword input
+    keyword = st.text_input("Enter keyword to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keyword and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit table
+        if df.empty:
+            st.write(f"No results found for keyword '{keyword}' in the '{category}' category.")
+        else:
+            st.table(df)
+####download link 
+User
+import os
+import sqlite3
+import pandas as pd
+import streamlit as st
+import re
+import base64
+
+# Base directory where your files are located
+base_directory = r"C:\Users\srija\OneDrive\Desktop\abc"
+
+def highlight_keyword(text, keyword):
+    """
+    Highlight the keyword in the text using HTML styling
+    """
+    return re.sub(r'(' + keyword + ')', r'<mark style="background-color: red;">\1</mark>', text, flags=re.IGNORECASE)
+
+
+def get_download_link(filename):
+    """
+    Generate a download link for the given filename
+    """
+    return f"[Download {filename}](./pdfs/{filename})"
+
+
+def download_file(file_path, file_name):
+    with open(file_path, "rb") as file:
+        file_content = file.read()
+        b64 = base64.b64encode(file_content).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{file_name}">Download {file_name}</a>'
+        return href
+
+
+def search_data(db_name, keyword, category):
+    conn = sqlite3.connect(db_name)
+
+    # Prepare SQL query
+    query = f"SELECT * FROM filedetails WHERE text LIKE ? AND category = ?"
+
+    # Fetch data with keyword and category
+    df = pd.read_sql_query(query, conn, params=('%' + keyword + '%', category))
+
+    conn.close()
+
+    # Highlight keyword in text column
+    df['text'] = df['text'].apply(highlight_keyword, keyword=keyword)
+
+    # Add download link column
+    df['Download'] = df['filename'].apply(lambda x: download_file(os.path.join(base_directory, category, x), x))
+
+    return df
+
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+    st.set_page_config(
+        page_title="Hyundai Motor India Limited",
+        layout="wide",
+    )
+    st.title('Contracts, Policies, and ISO Search BOT')
+    st.markdown('<style>h1{text-decoration: underline;text-align: center;}</style>', unsafe_allow_html=True)
+    st.markdown('<style>body{background-color: #f4f4f4;}</style>', unsafe_allow_html=True)
+    # Search keyword input
+    keyword = st.text_input("Enter keyword to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keyword and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit custom table
+        if df.empty:
+            st.write(f"No results found for keyword '{keyword}' in the '{category}' category.")
+        else:
+            st.write(df.drop(columns=['filename']).to_html(escape=False, index=False), unsafe_allow_html=True)
+###main2
+User
+    src_folder = r"C:\Users\srija\OneDrive\Desktop\abc"
+import os
+import pytesseract
+from PIL import Image
+import fitz
+import cv2
+import numpy as np
+import sqlite3
+import io
+import pandas as pd
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+def correct_skewness(image):
+    """
+    Corrects skewness of the image, if necessary
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated
+
+
+def extract_text_from_image(image):
+    """
+    Extract text from image using pytesseract
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray_image)
+    return text.strip()
+
+
+def check_scanned_pdf(pdf_file):
+    """
+    Check if PDF contains images
+    """
+    images = []
+
+    pdf_doc = fitz.open(pdf_file)
+    for page_num in range(len(pdf_doc)):
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = pdf_doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            images.append((image, page_num + 1))  # Tuple with image and page number
+
+    return images
+
+
+def extract_text_from_pdf(pdf_file):
+    """
+    Extract text from PDF using OCR for scanned PDFs
+    """
+    extracted_texts = []
+
+    images = check_scanned_pdf(pdf_file)
+    if images:
+        for image, page_num in images:
+            deskewed_image = correct_skewness(image)
+            text = extract_text_from_image(deskewed_image)
+            extracted_texts.append((page_num, text.strip()))
+
+    if not extracted_texts:
+        pdf_doc = fitz.open(pdf_file)
+        extracted_texts = [(index + 1, page.get_text().strip()) for index, page in enumerate(pdf_doc)]
+
+    return extracted_texts
+
+
+def extract_text_from_directory(src_folder, db_name):
+    """
+    Extract text from PDFs in subfolders and save to SQLite database
+    """
+    # Create SQLite table
+    create_sqlite_table(db_name)
+
+    # Iterate through subfolders
+    for subfolder in ['Contracts', 'Policies', 'ISO']:
+        sub_src_folder = os.path.join(src_folder, subfolder)
+
+        for filename in os.listdir(sub_src_folder):
+            if filename.endswith('.pdf'):
+                src_path = os.path.join(sub_src_folder, filename)
+
+                # Extract text from PDF
+                texts = extract_text_from_pdf(src_path)
+
+                # Insert into SQLite table
+                insert_into_sqlite_table(db_name, filename, subfolder, texts)
+                print(f"Inserted text from {filename} in folder {subfolder} into SQLite table")
+
+
+def create_sqlite_table(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Create table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS filedetails (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT,
+        category TEXT,
+        pagenumber INTEGER,
+        text TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def insert_into_sqlite_table(db_name, file_name, category, texts):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Insert data
+    for page_num, text in texts:
+        cursor.execute("INSERT INTO filedetails (filename, category, pagenumber, text) VALUES (?, ?, ?, ?)",
+                       (file_name, category, page_num, text))
+
+    conn.commit()
+    conn.close()
+
+
+def fetch_data(db_name):
+    conn = sqlite3.connect(db_name)
+    query = "SELECT * FROM filedetails"
+    df = pd.read_sql_query(query, conn)
+    conn.close() 
+this is the source file path
+    return df
+
+########multi search
+import os
+import sqlite3
+import pandas as pd
+import streamlit as st
+import re
+import base64
+
+# Base directory where your files are located
+base_directory = r"C:\Users\srija\OneDrive\Desktop\abc"
+
+def highlight_keywords(text, keyword_colors):
+    """
+    Highlight the keywords in the text using HTML styling with different colors
+    """
+    for keyword, color in keyword_colors:
+        text = re.sub(r'(' + re.escape(keyword) + ')', r'<mark style="background-color: {};">\1</mark>'.format(color), text, flags=re.IGNORECASE)
+    return text
+
+def get_download_link(filename):
+    """
+    Generate a download link for the given filename
+    """
+    return f"[Download {filename}](./pdfs/{filename})"
+
+def download_file(file_path, file_name):
+    with open(file_path, "rb") as file:
+        file_content = file.read()
+        b64 = base64.b64encode(file_content).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{file_name}">Download {file_name}</a>'
+        return href
+
+def search_data(db_name, keywords, category):
+    conn = sqlite3.connect(db_name)
+
+    # Prepare SQL query
+    query = f"SELECT * FROM filedetails WHERE category = ?"
+
+    # Fetch data with category
+    df = pd.read_sql_query(query, conn, params=(category,))
+
+    conn.close()
+
+    # Split keywords by comma and assign colors
+    keyword_list = [keyword.strip() for keyword in keywords.split(",")]
+    colors = ['#ff0000', '#00ff00', '#0000ff']  # Example colors: red, green, blue
+    keyword_colors = list(zip(keyword_list, colors))
+
+    # Filter DataFrame based on keywords
+    filtered_df = df[df['text'].apply(lambda x: all(keyword.lower() in x.lower() for keyword in keyword_list))]
+
+    # Highlight keywords in text column
+    filtered_df['text'] = filtered_df['text'].apply(lambda x: highlight_keywords(x, keyword_colors))
+
+    # Add download link column
+    filtered_df['Download'] = filtered_df['filename'].apply(lambda x: download_file(os.path.join(base_directory, category, x), x))
+
+    return filtered_df
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+    st.set_page_config(
+        page_title="Hyundai Motor India Limited",
+        layout="wide",
+    )
+    st.title('Contracts, Policies, and ISO Search BOT')
+    st.markdown('<style>h1{text-decoration: underline;text-align: center;}</style>', unsafe_allow_html=True)
+    st.markdown('<style>body{background-color: #f4f4f4;}</style>', unsafe_allow_html=True)
+
+    # Search keyword input
+    keyword = st.text_input("Enter keywords separated by commas to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keywords and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit custom table
+        if df.empty:
+            st.write(f"No results found for keywords '{keyword}' in the '{category}' category.")
+        else:
+            st.write(df.drop(columns=['filename']).to_html(escape=False, index=False), unsafe_allow_html=True)
+#########no dups
+import os
+import sqlite3
+import pandas as pd
+import streamlit as st
+
+# Base directory where your files are located
+base_directory = r"C:\Users\srija\OneDrive\Desktop\abc"
+
+def fetch_data(db_name):
+    conn = sqlite3.connect(db_name)
+    query = "SELECT * FROM filedetails"
+    df = pd.read_sql_query(query, conn)
+    conn.close() 
+    return df
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+    
+    st.set_page_config(
+        page_title="Hyundai Motor India Limited",
+        layout="wide",
+    )
+    
+    st.title('Contracts, Policies, and ISO Search BOT')
+    st.markdown('<style>h1{text-decoration: underline;text-align: center;}</style>', unsafe_allow_html=True)
+    st.markdown('<style>body{background-color: #f4f4f4;}</style>', unsafe_allow_html=True)
+
+    # Fetch and display top 3 rows
+    df = fetch_data(db_name)
+    
+    st.write("Top 3 rows of the database:")
+    st.table(df.head(3))
+display this data code
+import os
+import sqlite3
+import pandas as pd
+import streamlit as st
+import re
+import base64
+
+# Base directory where your files are located
+base_directory = r"C:\Users\srija\OneDrive\Desktop\abc"
+
+def highlight_keywords(text, keyword_colors):
+    """
+    Highlight the keywords in the text using HTML styling with different colors
+    """
+    for keyword, color in keyword_colors:
+        text = re.sub(r'(' + re.escape(keyword) + ')', r'<mark style="background-color: {};">\1</mark>'.format(color), text, flags=re.IGNORECASE)
+    return text
+
+def get_download_link(filename):
+    """
+    Generate a download link for the given filename
+    """
+    return f"[Download {filename}](./pdfs/{filename})"
+
+def download_file(file_path, file_name):
+    with open(file_path, "rb") as file:
+        file_content = file.read()
+        b64 = base64.b64encode(file_content).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{file_name}">Download {file_name}</a>'
+        return href
+
+
+def search_data(db_name, keywords, category):
+    conn = sqlite3.connect(db_name)
+    query = f"SELECT * FROM filedetails WHERE category = ?"
+    df = pd.read_sql_query(query, conn, params=(category,))
+    conn.close()
+
+    # Check if df is empty
+    if df.empty:
+        print(f"No data found for category: {category}")
+        return df
+
+    keyword_list = [keyword.strip() for keyword in keywords.split(",")]
+    colors = ['#ff0000', '#00ff00', '#0000ff']
+    keyword_colors = list(zip(keyword_list, colors))
+
+    filtered_df = df[df['text'].apply(lambda x: all(keyword.lower() in x.lower() for keyword in keyword_list))]
+
+    filtered_df['text'] = filtered_df['text'].apply(lambda x: highlight_keywords(x, keyword_colors))
+    filtered_df['Download'] = filtered_df['filename'].apply(
+        lambda x: download_file(os.path.join(base_directory, category, x), x))
+    filtered_df = filtered_df.drop_duplicates(subset=['filename', 'text', 'pagenumber', 'category'])
+
+    return filtered_df
+
+
+if __name__ == "__main__":
+    src_folder = r"C:\Users\srija\OneDrive\Desktop\abc"
+    db_name = "filedetails.db"
+    st.set_page_config(
+        page_title="Hyundai Motor India Limited",
+        layout="wide",
+    )
+    st.title('Contracts, Policies, and ISO Search BOT')
+    st.markdown('<style>h1{text-decoration: underline;text-align: center;}</style>', unsafe_allow_html=True)
+    st.markdown('<style>body{background-color: #f4f4f4;}</style>', unsafe_allow_html=True)
+
+    # Search keyword input
+    keyword = st.text_input("Enter keywords separated by commas to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keywords and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit custom table
+        if df.empty:
+            st.write(f"No results found for keywords '{keyword}' in the '{category}' category.")
+        else:
+            st.write(df.drop(columns=['filename']).to_html(escape=False, index=False), unsafe_allow_html=True)
+####data_extraction.py
+import os
+import sqlite3
+import pytesseract
+from PIL import Image
+import fitz
+import cv2
+import numpy as np
+import io
+
+# Base directory where your files are located
+base_directory = r"C:\Users\srija\OneDrive\Desktop\abc"
+
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+def correct_skewness(image):
+    """
+    Corrects skewness of the image, if necessary
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated
+
+
+def extract_text_from_image(image):
+    """
+    Extract text from image using pytesseract
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray_image)
+    return text.strip()
+
+
+def check_scanned_pdf(pdf_file):
+    """
+    Check if PDF contains images
+    """
+    images = []
+
+    pdf_doc = fitz.open(pdf_file)
+    for page_num in range(len(pdf_doc)):
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = pdf_doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            images.append((image, page_num + 1))  # Tuple with image and page number
+
+    return images
+
+
+def extract_text_from_pdf(pdf_file):
+    """
+    Extract text from PDF using OCR for scanned PDFs
+    """
+    extracted_texts = []
+
+    images = check_scanned_pdf(pdf_file)
+    if images:
+        for image, page_num in images:
+            deskewed_image = correct_skewness(image)
+            text = extract_text_from_image(deskewed_image)
+            extracted_texts.append((page_num, text.strip()))
+
+    if not extracted_texts:
+        pdf_doc = fitz.open(pdf_file)
+        extracted_texts = [(index + 1, page.get_text().strip()) for index, page in enumerate(pdf_doc)]
+
+    return extracted_texts
+
+
+def extract_text_from_directory(src_folder, db_name):
+    """
+    Extract text from PDFs in subfolders and save to SQLite database
+    """
+    # Create SQLite table
+    create_sqlite_table(db_name)
+
+    # Iterate through subfolders
+    for subfolder in ['Contracts', 'Policies', 'ISO']:
+        sub_src_folder = os.path.join(src_folder, subfolder)
+
+        for filename in os.listdir(sub_src_folder):
+            if filename.endswith('.pdf'):
+                src_path = os.path.join(sub_src_folder, filename)
+
+                # Extract text from PDF
+                texts = extract_text_from_pdf(src_path)
+
+                # Insert into SQLite table
+                insert_into_sqlite_table(db_name, filename, subfolder, texts)
+                print(f"Inserted text from {filename} in folder {subfolder} into SQLite table")
+
+
+def create_sqlite_table(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Create table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS filedetails (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT,
+        category TEXT,
+        pagenumber INTEGER,
+        text TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def insert_into_sqlite_table(db_name, file_name, category, texts):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Insert data
+    for page_num, text in texts:
+        cursor.execute("INSERT INTO filedetails (filename, category, pagenumber, text) VALUES (?, ?, ?, ?)",
+                       (file_name, category, page_num, text))
+
+    conn.commit()
+    conn.close()
+
+
+if __name__ == "__main__":
+    extract_text_from_directory(base_directory, "filedetails.db")
+###app
+import os
+import sqlite3
+import pandas as pd
+import streamlit as st
+import re
+import base64
+
+# Base directory where your files are located
+base_directory = r"C:\Users\srija\OneDrive\Desktop\abc"
+
+
+def fetch_data(db_name):
+    conn = sqlite3.connect(db_name)
+    query = "SELECT * FROM filedetails"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+def highlight_keywords(text, keyword_colors):
+    """
+    Highlight the keywords in the text using HTML styling with different colors
+    """
+    for keyword, color in keyword_colors:
+        text = re.sub(r'(' + re.escape(keyword) + ')', r'<mark style="background-color: {};">\1</mark>'.format(color),
+                      text, flags=re.IGNORECASE)
+    return text
+
+
+def get_download_link(filename):
+    """
+    Generate a download link for the given filename
+    """
+    return f"[Download {filename}](./pdfs/{filename})"
+
+
+def download_file(file_path, file_name):
+    with open(file_path, "rb") as file:
+        file_content = file.read()
+        b64 = base64.b64encode(file_content).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="{file_name}">Download {file_name}</a>'
+        return href
+
+
+def search_data(db_name, keywords, category):
+    conn = sqlite3.connect(db_name)
+    query = f"SELECT * FROM filedetails WHERE category = ?"
+    df = pd.read_sql_query(query, conn, params=(category,))
+    conn.close()
+
+    # Check if df is empty
+    if df.empty:
+        print(f"No data found for category: {category}")
+        return df
+
+    keyword_list = [keyword.strip() for keyword in keywords.split(",")]
+    colors = ['#ff0000', '#00ff00', '#0000ff']
+    keyword_colors = list(zip(keyword_list, colors))
+
+    filtered_df = df[df['text'].apply(lambda x: all(keyword.lower() in x.lower() for keyword in keyword_list))]
+
+    filtered_df['text'] = filtered_df['text'].apply(lambda x: highlight_keywords(x, keyword_colors))
+    filtered_df['Download'] = filtered_df['filename'].apply(
+        lambda x: download_file(os.path.join(base_directory, category, x), x))
+    filtered_df = filtered_df.drop_duplicates(subset=['filename', 'text', 'pagenumber', 'category'])
+
+    return filtered_df
+
+
+if __name__ == "__main__":
+    src_folder = r"C:\Users\srija\OneDrive\Desktop\abc"
+    db_name = "filedetails.db"
+    st.set_page_config(
+        page_title="Hyundai Motor India Limited",
+        layout="wide",
+    )
+    st.title('Contracts, Policies, and ISO Search BOT')
+    st.markdown('<style>h1{text-decoration: underline;text-align: center;}</style>', unsafe_allow_html=True)
+    st.markdown('<style>body{background-color: #f4f4f4;}</style>', unsafe_allow_html=True)
+
+    # Search keyword input
+    keyword = st.text_input("Enter keywords separated by commas to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keywords and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit custom table
+        if df.empty:
+            st.write(f"No results found for keywords '{keyword}' in the '{category}' category.")
+        else:
+            st.write(df.drop(columns=['filename']).to_html(escape=False, index=False), unsafe_allow_html=True)
+####os path
+import os
+import pytesseract
+from PIL import Image
+import fitz
+import cv2
+import numpy as np
+import sqlite3
+import io
+import pandas as pd
+
+# Set the path for Tesseract OCR
+pytesseract.pytesseract.tesseract_cmd = os.path.join(os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe'))
+
+
+def correct_skewness(image):
+    """
+    Corrects skewness of the image, if necessary
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thresh > 0))
+    angle = cv2.minAreaRect(coords)[-1]
+
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    h, w = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+    return rotated
+
+
+def extract_text_from_image(image):
+    """
+    Extract text from image using pytesseract
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    text = pytesseract.image_to_string(gray_image)
+    return text.strip()
+
+
+def check_scanned_pdf(pdf_file):
+    """
+    Check if PDF contains images
+    """
+    images = []
+
+    pdf_doc = fitz.open(pdf_file)
+    for page_num in range(len(pdf_doc)):
+        page = pdf_doc[page_num]
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            xref = img[0]
+            base_image = pdf_doc.extract_image(xref)
+            image_bytes = base_image["image"]
+            image = Image.open(io.BytesIO(image_bytes))
+            image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            images.append((image, page_num + 1))  # Tuple with image and page number
+
+    return images
+
+
+def extract_text_from_pdf(pdf_file):
+    """
+    Extract text from PDF using OCR for scanned PDFs
+    """
+    extracted_texts = []
+
+    images = check_scanned_pdf(pdf_file)
+    if images:
+        for image, page_num in images:
+            deskewed_image = correct_skewness(image)
+            text = extract_text_from_image(deskewed_image)
+            extracted_texts.append((page_num, text.strip()))
+
+    if not extracted_texts:
+        pdf_doc = fitz.open(pdf_file)
+        extracted_texts = [(index + 1, page.get_text().strip()) for index, page in enumerate(pdf_doc)]
+
+    return extracted_texts
+
+
+def extract_text_from_directory(src_folder, db_name):
+    """
+    Extract text from PDFs in subfolders and save to SQLite database
+    """
+    # Create SQLite table
+    create_sqlite_table(db_name)
+
+    # Iterate through subfolders
+    for subfolder in ['Contracts', 'Policies', 'ISO']:
+        sub_src_folder = os.path.join(src_folder, subfolder)
+
+        for filename in os.listdir(sub_src_folder):
+            if filename.endswith('.pdf'):
+                src_path = os.path.join(sub_src_folder, filename)
+
+                # Extract text from PDF
+                texts = extract_text_from_pdf(src_path)
+
+                # Insert into SQLite table
+                insert_into_sqlite_table(db_name, filename, subfolder, texts)
+                print(f"Inserted text from {filename} in folder {subfolder} into SQLite table")
+
+
+def create_sqlite_table(db_name):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Create table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS filedetails (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename TEXT,
+        category TEXT,
+        pagenumber INTEGER,
+        text TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def insert_into_sqlite_table(db_name, file_name, category, texts):
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    # Insert data
+    for page_num, text in texts:
+        cursor.execute("INSERT INTO filedetails (filename, category, pagenumber, text) VALUES (?, ?, ?, ?)",
+                       (file_name, category, page_num, text))
+
+    conn.commit()
+    conn.close()
+
+
+def fetch_data(db_name):
+    conn = sqlite3.connect(db_name)
+    query = "SELECT * FROM filedetails"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+#########app2
+import os
+import sqlite3
+import pandas as pd
+import streamlit as st
+import re
+import base64
+from data_extraction import fetch_data, highlight_keywords, get_download_link, download_file
+
+# Base directory where your files are located
+base_directory = os.path.join(os.getenv('BASE_DIR', r"C:\Users\srija\OneDrive\Desktop\abc"))
+
+
+def search_data(db_name, keywords, category):
+    conn = sqlite3.connect(db_name)
+    query = f"SELECT * FROM filedetails WHERE category = ?"
+    df = pd.read_sql_query(query, conn, params=(category,))
+    conn.close()
+
+    # Check if df is empty
+    if df.empty:
+        print(f"No data found for category: {category}")
+        return df
+
+    keyword_list = [keyword.strip() for keyword in keywords.split(",")]
+    colors = ['#ff0000', '#00ff00', '#0000ff']
+    keyword_colors = list(zip(keyword_list, colors))
+
+    filtered_df = df[df['text'].apply(lambda x: all(keyword.lower() in x.lower() for keyword in keyword_list))]
+
+    filtered_df['text'] = filtered_df['text'].apply(lambda x: highlight_keywords(x, keyword_colors))
+    filtered_df['Download'] = filtered_df['filename'].apply(
+        lambda x: download_file(os.path.join(base_directory, category, x), x))
+    filtered_df = filtered_df.drop_duplicates(subset=['filename', 'text', 'pagenumber', 'category'])
+
+    return filtered_df
+
+
+if __name__ == "__main__":
+    db_name = "filedetails.db"
+    st.set_page_config(
+        page_title="Hyundai Motor India Limited",
+        layout="wide",
+    )
+    st.title('Contracts, Policies, and ISO Search BOT')
+    st.markdown('<style>h1{text-decoration: underline;text-align: center;}</style>', unsafe_allow_html=True)
+    st.markdown('<style>body{background-color: #f4f4f4;}</style>', unsafe_allow_html=True)
+
+    # Search keyword input
+    keyword = st.text_input("Enter keywords separated by commas to search:", "")
+
+    # Category selection
+    category = st.selectbox(
+        "Select Category:",
+        ("Contracts", "ISO", "Policies")
+    )
+
+    if st.button("Search"):
+        # Fetch data based on keywords and category
+        df = search_data(db_name, keyword, category)
+
+        # Display results in Streamlit custom table
+        if df.empty:
+            st.write(f"No results found for keywords '{keyword}' in the '{category}' category.")
+        else:
+            st.write(df.drop(columns=['filename']).to_html(escape=False, index=False), unsafe_allow_html=True)
+
